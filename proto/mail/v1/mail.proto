@@ -1,0 +1,449 @@
+syntax = "proto3";
+
+// Контракт почтового микросервиса, версия v1.
+// Вызывается бэкендами сайтов и админкой бэк-офиса (server-to-server).
+// Аутентификация — метаданные x-api-key; у ключа скоупы: send / read / admin.
+// Send-ключ дополнительно ограничен списком разрешённых доменов отправителя.
+package mail.v1;
+
+option go_package = "github.com/erkkipm/mail_proto/gen/go/mail/v1;mailv1";
+
+// ===========================================================================
+// SendService — отправка писем (скоуп send).
+// ===========================================================================
+service SendService {
+  // Поставить письмо в очередь отправки. Возвращает message_id и статус
+  // по каждому получателю. Повтор с тем же idempotency_key вернёт прежний
+  // message_id без повторной отправки.
+  rpc SendEmail(SendEmailRequest) returns (SendEmailResponse);
+  // Статус доставки по message_id (по всем получателям).
+  rpc GetMessageStatus(GetMessageStatusRequest) returns (GetMessageStatusResponse);
+}
+
+// ===========================================================================
+// MailboxService — чтение почты из бэк-офиса (скоуп read).
+// ===========================================================================
+service MailboxService {
+  rpc ListMailboxMessages(ListMailboxMessagesRequest) returns (ListMailboxMessagesResponse);
+  rpc GetMessage(GetMessageRequest) returns (GetMessageResponse);
+  // Исходный .eml — для скачивания/отладки заголовков.
+  rpc GetRawMessage(GetRawMessageRequest) returns (GetRawMessageResponse);
+  rpc SetMessageFlags(SetMessageFlagsRequest) returns (SetMessageFlagsResponse);
+}
+
+// ===========================================================================
+// AdminService — управление доменами, ящиками, очередью (скоуп admin).
+// ===========================================================================
+service AdminService {
+  // --- Домены ---
+  // Добавляет домен, генерирует DKIM-ключ, возвращает DNS-записи для прописывания.
+  rpc AddDomain(AddDomainRequest) returns (AddDomainResponse);
+  rpc ListDomains(ListDomainsRequest) returns (ListDomainsResponse);
+  rpc SetDomainActive(SetDomainActiveRequest) returns (SetDomainActiveResponse);
+  // DNS-записи домена + актуальный статус их проверки.
+  rpc GetDomainDNSRecords(GetDomainDNSRecordsRequest) returns (GetDomainDNSRecordsResponse);
+  // Сервер сам резолвит DNS и сверяет MX/SPF/DKIM/DMARC.
+  rpc VerifyDomainDNS(VerifyDomainDNSRequest) returns (VerifyDomainDNSResponse);
+  // Новый DKIM-ключ с новым селектором; старый остаётся до retire (двойной период).
+  rpc RotateDKIMKey(RotateDKIMKeyRequest) returns (RotateDKIMKeyResponse);
+
+  // --- Ящики и алиасы ---
+  rpc CreateMailbox(CreateMailboxRequest) returns (CreateMailboxResponse);
+  rpc ListMailboxes(ListMailboxesRequest) returns (ListMailboxesResponse);
+  rpc SetMailboxPassword(SetMailboxPasswordRequest) returns (SetMailboxPasswordResponse);
+  rpc SetMailboxActive(SetMailboxActiveRequest) returns (SetMailboxActiveResponse);
+  rpc CreateAlias(CreateAliasRequest) returns (CreateAliasResponse);
+  rpc DeleteAlias(DeleteAliasRequest) returns (DeleteAliasResponse);
+
+  // --- Очередь отправки ---
+  rpc ListQueue(ListQueueRequest) returns (ListQueueResponse);
+  rpc RetryQueueItem(RetryQueueItemRequest) returns (RetryQueueItemResponse);
+  rpc CancelQueueItem(CancelQueueItemRequest) returns (CancelQueueItemResponse);
+
+  // --- Подавление (bounce-список) ---
+  rpc ListSuppressions(ListSuppressionsRequest) returns (ListSuppressionsResponse);
+  rpc RemoveSuppression(RemoveSuppressionRequest) returns (RemoveSuppressionResponse);
+
+  // --- Статистика отправки ---
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+}
+
+// ===========================================================================
+// Общие типы
+// ===========================================================================
+
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_QUEUED = 1;    // в очереди
+  DELIVERY_STATUS_SENDING = 2;   // отправляется сейчас
+  DELIVERY_STATUS_SENT = 3;      // принято сервером получателя
+  DELIVERY_STATUS_DEFERRED = 4;  // временная ошибка, будет повтор
+  DELIVERY_STATUS_BOUNCED = 5;   // постоянный отказ получателя
+  DELIVERY_STATUS_FAILED = 6;    // исчерпаны повторы / подавлен
+  DELIVERY_STATUS_CANCELLED = 7; // отменено администратором
+}
+
+message Attachment {
+  string filename = 1;
+  string content_type = 2;
+  bytes data = 3;
+}
+
+// Метаданные вложения без содержимого (для списков и GetMessage).
+message AttachmentInfo {
+  string filename = 1;
+  string content_type = 2;
+  int64 size = 3;
+}
+
+// ===========================================================================
+// SendService
+// ===========================================================================
+
+message SendEmailRequest {
+  // Адрес отправителя; домен обязан быть среди обслуживаемых и разрешённых ключу.
+  string from_address = 1;
+  string from_name = 2;
+  repeated string to = 3;
+  repeated string cc = 4;
+  repeated string bcc = 5;
+  string reply_to = 6;
+  string subject = 7;
+  // Хотя бы одно из text_body/html_body обязательно.
+  string text_body = 8;
+  string html_body = 9;
+  repeated Attachment attachments = 10; // суммарно не более 20 МБ
+  // Дополнительные заголовки; разрешены только X-* и List-Unsubscribe.
+  map<string, string> headers = 11;
+  // Ключ идемпотентности: повтор вернёт прежний message_id.
+  string idempotency_key = 12;
+  // Категория для статистики: "auth_code", "application_confirm", "registration"...
+  string category = 13;
+}
+
+message RecipientStatus {
+  string address = 1;
+  DeliveryStatus status = 2;
+  string detail = 3; // причина (suppressed, invalid address...) либо SMTP-ответ
+}
+
+message SendEmailResponse {
+  string message_id = 1; // Message-ID письма (он же ключ GetMessageStatus)
+  repeated RecipientStatus recipients = 2;
+}
+
+message GetMessageStatusRequest {
+  string message_id = 1;
+}
+
+message GetMessageStatusResponse {
+  string message_id = 1;
+  repeated RecipientStatus recipients = 2;
+}
+
+// ===========================================================================
+// MailboxService
+// ===========================================================================
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_INBOUND = 1;
+  DIRECTION_OUTBOUND = 2;
+}
+
+message ListMailboxMessagesRequest {
+  // Фильтры; пустое поле = без фильтра.
+  string mailbox = 1;   // полный адрес ящика: user@domain
+  string folder = 2;    // INBOX, Sent, Junk, Trash, Drafts
+  Direction direction = 3;
+  int64 date_from_unix = 4;
+  int64 date_to_unix = 5;
+  string query = 6;     // полнотекстовый поиск (тема, отправитель, текст)
+  bool unseen_only = 7;
+  int32 page_size = 8;  // по умолчанию 50, максимум 500
+  string page_token = 9;
+}
+
+message MessageSummary {
+  int64 id = 1; // внутренний id для GetMessage/флагов
+  string mailbox = 2;
+  string folder = 3;
+  Direction direction = 4;
+  string message_id_hdr = 5;
+  string from_address = 6;
+  string from_name = 7;
+  repeated string to = 8;
+  string subject = 9;
+  string snippet = 10;
+  int64 date_unix = 11;
+  int64 size = 12;
+  bool seen = 13;
+  bool answered = 14;
+  bool flagged = 15;
+  float spam_score = 16;
+  int32 attachment_count = 17;
+}
+
+message ListMailboxMessagesResponse {
+  repeated MessageSummary messages = 1;
+  string next_page_token = 2;
+}
+
+message GetMessageRequest {
+  int64 id = 1;
+}
+
+message GetMessageResponse {
+  MessageSummary summary = 1;
+  string text_body = 2;
+  string html_body = 3;
+  repeated AttachmentInfo attachments = 4;
+  // Результаты проверок входящего: spf, dkim, dmarc, dnsbl.
+  map<string, string> auth_results = 5;
+  repeated string cc = 6;
+  string reply_to = 7;
+}
+
+message GetRawMessageRequest {
+  int64 id = 1;
+}
+
+message GetRawMessageResponse {
+  bytes raw = 1; // .eml
+}
+
+message SetMessageFlagsRequest {
+  int64 id = 1;
+  // Меняются только переданные флаги.
+  optional bool seen = 2;
+  optional bool flagged = 3;
+  optional bool deleted = 4;
+}
+
+message SetMessageFlagsResponse {
+  bool success = 1;
+}
+
+// ===========================================================================
+// AdminService: домены
+// ===========================================================================
+
+message DNSRecord {
+  string type = 1;    // MX, TXT, A, PTR
+  string name = 2;    // имя записи (например, "_dmarc.example.ru")
+  string value = 3;   // значение для прописывания
+  string purpose = 4; // mx, spf, dkim, dmarc, ptr, tls-rpt
+  bool verified = 5;  // последний результат VerifyDomainDNS
+}
+
+message Domain {
+  int64 id = 1;
+  string name = 2;
+  bool active = 3;
+  string catch_all = 4; // адрес ящика catch-all, пусто = выключен
+  int64 created_at_unix = 5;
+  string dkim_selector = 6; // активный селектор
+  bool dns_verified = 7;
+}
+
+message AddDomainRequest {
+  string name = 1;
+  string catch_all = 2;
+}
+
+message AddDomainResponse {
+  Domain domain = 1;
+  repeated DNSRecord dns_records = 2;
+}
+
+message ListDomainsRequest {}
+
+message ListDomainsResponse {
+  repeated Domain domains = 1;
+}
+
+message SetDomainActiveRequest {
+  string name = 1;
+  bool active = 2;
+}
+
+message SetDomainActiveResponse {
+  bool success = 1;
+}
+
+message GetDomainDNSRecordsRequest {
+  string name = 1;
+}
+
+message GetDomainDNSRecordsResponse {
+  repeated DNSRecord dns_records = 1;
+}
+
+message VerifyDomainDNSRequest {
+  string name = 1;
+}
+
+message VerifyDomainDNSResponse {
+  bool all_verified = 1;
+  repeated DNSRecord dns_records = 2;
+}
+
+message RotateDKIMKeyRequest {
+  string domain = 1;
+}
+
+message RotateDKIMKeyResponse {
+  string new_selector = 1;
+  DNSRecord dkim_record = 2; // новая TXT-запись для прописывания
+}
+
+// ===========================================================================
+// AdminService: ящики
+// ===========================================================================
+
+message Mailbox {
+  int64 id = 1;
+  string address = 2; // user@domain
+  string display_name = 3;
+  bool active = 4;
+  int64 created_at_unix = 5;
+}
+
+message CreateMailboxRequest {
+  string address = 1;
+  string display_name = 2;
+  // Пусто — пароль сгенерируется и вернётся один раз в ответе.
+  string password = 3;
+}
+
+message CreateMailboxResponse {
+  Mailbox mailbox = 1;
+  string generated_password = 2; // только если пароль генерировался
+}
+
+message ListMailboxesRequest {
+  string domain = 1; // пусто = все домены
+}
+
+message ListMailboxesResponse {
+  repeated Mailbox mailboxes = 1;
+}
+
+message SetMailboxPasswordRequest {
+  string address = 1;
+  string password = 2; // пусто — сгенерировать
+}
+
+message SetMailboxPasswordResponse {
+  string generated_password = 1;
+}
+
+message SetMailboxActiveRequest {
+  string address = 1;
+  bool active = 2;
+}
+
+message SetMailboxActiveResponse {
+  bool success = 1;
+}
+
+message CreateAliasRequest {
+  string alias = 1;       // алиас: info@domain
+  string destination = 2; // существующий ящик: user@domain
+}
+
+message CreateAliasResponse {
+  bool success = 1;
+}
+
+message DeleteAliasRequest {
+  string alias = 1;
+}
+
+message DeleteAliasResponse {
+  bool success = 1;
+}
+
+// ===========================================================================
+// AdminService: очередь, подавления, статистика
+// ===========================================================================
+
+message QueueItem {
+  int64 id = 1;
+  string message_id_hdr = 2;
+  string from_address = 3;
+  string recipient = 4;
+  DeliveryStatus status = 5;
+  int32 attempts = 6;
+  int64 next_attempt_unix = 7;
+  int64 expires_at_unix = 8;
+  int32 last_smtp_code = 9;
+  string last_error = 10;
+  string category = 11;
+  int64 created_at_unix = 12;
+}
+
+message ListQueueRequest {
+  DeliveryStatus status = 1; // UNSPECIFIED = все активные (queued/sending/deferred)
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListQueueResponse {
+  repeated QueueItem items = 1;
+  string next_page_token = 2;
+}
+
+message RetryQueueItemRequest {
+  int64 id = 1;
+}
+
+message RetryQueueItemResponse {
+  bool success = 1;
+}
+
+message CancelQueueItemRequest {
+  int64 id = 1;
+}
+
+message CancelQueueItemResponse {
+  bool success = 1;
+}
+
+message Suppression {
+  string address = 1;
+  string reason = 2;
+  int64 created_at_unix = 3;
+}
+
+message ListSuppressionsRequest {}
+
+message ListSuppressionsResponse {
+  repeated Suppression suppressions = 1;
+}
+
+message RemoveSuppressionRequest {
+  string address = 1;
+}
+
+message RemoveSuppressionResponse {
+  bool success = 1;
+}
+
+message DomainDayStats {
+  string recipient_domain = 1;
+  string day = 2; // YYYY-MM-DD
+  int32 sent = 3;
+  int32 deferred = 4;
+  int32 bounced = 5;
+}
+
+message GetStatsRequest {
+  int64 date_from_unix = 1;
+  int64 date_to_unix = 2;
+}
+
+message GetStatsResponse {
+  repeated DomainDayStats stats = 1;
+  int64 queue_active = 2; // писем сейчас в очереди
+}
